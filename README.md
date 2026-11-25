@@ -8,9 +8,10 @@
 
 Именованные счётчики (create / set / add / get / clear / delete) и выгрузка в JSON с заданной периодичностью (например, 1 с).
 
-окно: counter_set_window, среднее по точкам за последние N секунд
-
-Связано с разбором L1-статистики OAI: метрики накапливаются в PHY (`phy_stats`), пишутся в `nrL1_stats.log`. Эта библиотека - свой слой учёта в JSON; 
+- окно: `counter_set_window(name, sec)` — включает окно (`window_enabled`) и задаёт длину в секундах;
+- среднее по точкам за последние N секунд: `window_avg`;
+- время точек: `CLOCK_MONOTONIC`, миллисекунды;
+- значения счётчиков: `double`.
 
 ## Сборка
 
@@ -44,9 +45,31 @@ sudo ./nr-uesoftmodem \
   --uicc0.imsi 001010000000001
 ```
 Сборка ZMQ-устройства: 
+
 ```bash
 ./cmake_targets/build_oai --gNB --nrUE -c -w ZMQ
 ```
+
+## Запуск на USRP B200 
+Нужны: CN5G, UHD, образы FPGA (UHD_IMAGES_DIR), USB 3.
+
+UE:
+```bash
+export UHD_IMAGES_DIR=/usr/local/share/uhd/images
+sudo -E ./nr-uesoftmodem \
+  -r 106 --numerology 1 --band 78 -C 3619200000 \
+  --ue-fo-compensation -E \
+  -O /path/to/nrue.uicc.conf
+```
+gNB:
+```bash
+cd .../cmake_targets/ran_build/build
+export UHD_IMAGES_DIR=/usr/local/share/uhd/images
+sudo -E ./nr-softmodem \
+  -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf \
+  --gNBs.[0].min_rxtxtime 6
+```
+
 ### Метрики (L1):
 
 | Имя | Описание |
@@ -60,9 +83,10 @@ sudo ./nr-uesoftmodem \
 | Имя | Описание |
 | --- | --- |
 | `rsrp` | SS-RSRP: мощность SSS в SSB, dBm (nr_ue_ssb_rsrp_measurements) |
-| `rssi` | rx_rssi_dBm OAI: мощность из оценок канала в nr_ue_measurements, dBm |
+| `rssi` | оценка мощности по RE OFDM-символа в частотной области (rxdataF), dBm |
 | `*_window_avg` | среднее по sliding window |
 | `*_window_sec` | длина окна (с) |
+| `*_window_enabled` | флаг включено ли окно |
 
 
 Проверка файла метрик:
