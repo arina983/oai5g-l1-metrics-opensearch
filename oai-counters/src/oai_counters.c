@@ -5,32 +5,40 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <stdint.h>
 
 #define MAX_COUNTERS 128
-#define NAME_LEN 64
-#define SAMPLE_MAX 64
+#define NAME_LEN 32
+#define SAMPLE_MAX 1024
 
 typedef struct {
-    time_t t;
-    long v;
+    int64_t time_ms;
+    double value;
 } sample_t;
 
 typedef struct {
     int used;
     char name[NAME_LEN];
-    long value;
+    double value;
     int window_sec;
+    int window_enabled; // влкючен ли sliding window для счетчика
     sample_t samples[SAMPLE_MAX];
-    int n;
+    int sample_count;
 } counter_t;
 
 static counter_t g_counters[MAX_COUNTERS];
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int g_auto_running = 0;
-static int g_auto_period  = 1;
+static int g_auto_period = 1;
 static char g_auto_path[256];
 static pthread_t g_auto_thread;
+
+static int64_t now_ms(void){
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000; // в мс
+}
 
 static int find_index(const char *name){
     for (int i = 0; i < MAX_COUNTERS; i++)
@@ -45,48 +53,48 @@ static int find_free(void){
             return i;
     return -1;
 }
-
 // убрать точки, которые вышли за окно
-static void remove_old(counter_t *c){
-    if (c->window_sec <= 0 || c->n == 0)
+static void remove_old(counter_t *counter){
+    if (!counter->window_enabled || counter->window_sec <= 0 || counter->sample_count == 0)
         return;
 
-    time_t cut = time(NULL) - c->window_sec;
-    int w = 0;
-    for (int i = 0; i < c->n; i++) {
-        if (c->samples[i].t >= cut)
-            c->samples[w++] = c->samples[i];
+    int64_t cut = now_ms() - (int64_t)counter->window_sec * 1000;
+    int write_idx = 0;
+
+    for (int i = 0; i < counter->sample_count; i++) {
+        if (counter->samples[i].time_ms >= cut)
+            counter->samples[write_idx++] = counter->samples[i];
     }
-    c->n = w;
+    counter->sample_count = write_idx;
 }
 
-// добавить новую точку
-static void push_sample(counter_t *c, long v){
-    if (c->window_sec <= 0)
+static void push_sample(counter_t *counter, double sample_value){
+    if (!counter->window_enabled || counter->window_sec <= 0)
         return;
 
-    // если буфер полный выкидываем самую старую
-    if (c->n >= SAMPLE_MAX) {
+    if (counter->sample_count == SAMPLE_MAX) {
         for (int i = 1; i < SAMPLE_MAX; i++)
-            c->samples[i - 1] = c->samples[i];
-        c->n = SAMPLE_MAX - 1;
+            counter->samples[i - 1] = counter->samples[i];
+        counter->sample_count = SAMPLE_MAX - 1;
     }
-    c->samples[c->n].t = time(NULL);
-    c->samples[c->n].v = v;
-    c->n++;
-    remove_old(c);
+    counter->samples[counter->sample_count].time_ms = now_ms();
+    counter->samples[counter->sample_count].value = sample_value;
+    counter->sample_count++;
+    remove_old(counter);
 }
 
-// среднее по окну
-static long avg_samples(counter_t *c){
-    remove_old(c);
-    if (c->n == 0)
-        return c->value;   // если нет точек возвращаем текущее значение
+static double avg_samples(counter_t *counter){
+    if (!counter->window_enabled || counter->window_sec <= 0)
+        return counter->value;
 
-    long sum = 0;
-    for (int i = 0; i < c->n; i++)
-        sum += c->samples[i].v;
-    return sum / c->n;
+    remove_old(counter);
+    if (counter->sample_count == 0)
+        return counter->value;
+
+    double sum = 0.0;
+    for (int i = 0; i < counter->sample_count; i++)
+        sum += counter->samples[i].value;
+    return sum / (double)counter->sample_count;
 }
 
 int counter_create(const char *name){
@@ -109,15 +117,16 @@ int counter_create(const char *name){
     g_counters[idx].used = 1;
     strncpy(g_counters[idx].name, name, NAME_LEN - 1);
     g_counters[idx].name[NAME_LEN - 1] = '\0';
-    g_counters[idx].value = 0;
-    g_counters[idx].window_sec = 5;
-    g_counters[idx].n = 0;
+    g_counters[idx].value = 0.0;
+    g_counters[idx].window_sec = 0;
+    g_counters[idx].window_enabled = 0;
+    g_counters[idx].sample_count = 0;
 
     pthread_mutex_unlock(&g_mutex);
     return 0;
 }
 
-int counter_set(const char *name, long value){
+int counter_set(const char *name, double value){
     if (!name)
         return -1;
 
@@ -133,7 +142,7 @@ int counter_set(const char *name, long value){
     return 0;
 }
 
-int counter_add(const char *name, long delta){
+int counter_add(const char *name, double delta){
     if (!name)
         return -1;
 
@@ -149,7 +158,7 @@ int counter_add(const char *name, long delta){
     return 0;
 }
 
-int counter_get(const char *name, long *out){
+int counter_get(const char *name, double *out){
     if (!name || !out)
         return -1;
 
@@ -165,7 +174,7 @@ int counter_get(const char *name, long *out){
 }
 
 int counter_clear(const char *name){
-    return counter_set(name, 0);
+    return counter_set(name, 0.0);
 }
 
 int counter_delete(const char *name){
@@ -180,14 +189,14 @@ int counter_delete(const char *name){
     }
     g_counters[idx].used = 0;
     g_counters[idx].name[0] = '\0';
-    g_counters[idx].value = 0;
+    g_counters[idx].value = 0.0;
     g_counters[idx].window_sec = 0;
-    g_counters[idx].n = 0;
+    g_counters[idx].window_enabled = 0;
+    g_counters[idx].sample_count = 0;
     pthread_mutex_unlock(&g_mutex);
     return 0;
 }
 
-// sliding window 
 int counter_set_window(const char *name, int window_sec){
     if (!name || window_sec < 0)
         return -1;
@@ -199,12 +208,18 @@ int counter_set_window(const char *name, int window_sec){
         return -1;
     }
     g_counters[idx].window_sec = window_sec;
-    remove_old(&g_counters[idx]);
+    g_counters[idx].window_enabled = (window_sec > 0) ? 1 : 0;
+
+    if (g_counters[idx].window_enabled)
+        remove_old(&g_counters[idx]);
+    else
+        g_counters[idx].sample_count = 0;
+
     pthread_mutex_unlock(&g_mutex);
     return 0;
 }
 
-int counter_window_avg(const char *name, long *out){
+int counter_window_avg(const char *name, double *out){
     if (!name || !out)
         return -1;
 
@@ -239,16 +254,16 @@ int counters_dump_json(const char *path){
     for (int i = 0; i < MAX_COUNTERS; i++) {
         if (!g_counters[i].used)
             continue;
-
         if (!first)
             fprintf(f, ",\n");
         first = 0;
 
-        long avg = avg_samples(&g_counters[i]);
+        double avg = avg_samples(&g_counters[i]);
 
-        fprintf(f, "    { \"name\": \"%s\", \"value\": %ld, "
-            "\"window_sec\": %d, \"window_avg\": %ld }",
-            g_counters[i].name, g_counters[i].value, g_counters[i].window_sec, avg);
+        fprintf(f,
+            "    { \"name\": \"%s\", \"value\": %.6f, "
+            "\"window_enabled\": %d, \"window_sec\": %d, \"window_avg\": %.6f }",
+            g_counters[i].name, g_counters[i].value, g_counters[i].window_enabled, g_counters[i].window_sec, avg);
     }
 
     fprintf(f, "\n  ]\n}\n");
